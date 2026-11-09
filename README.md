@@ -100,13 +100,13 @@ docker compose exec relay node src/relay/show-key.ts
 
 Windows 电脑仍使用完整项目中的根目录启动器，服务器上不需要启动它：
 
-1. 安装 Node.js 24 LTS，双击仓库根目录的 `start.cmd`。
+1. 安装 Node.js 24 LTS，双击主仓库根目录的 `start.cmd`。
 2. 首次向导选择连接中继，填写服务器地址、刚才查看的注册密钥和工作目录。
 3. Agent 连接后，手机填写相同服务器地址与 **Windows 显示的短配对码**。
 
 **注册密钥填电脑，短配对码填手机。** 后续启动复用已保存的配置。电脑启动器窗口需要保持打开；修改连接用 `start.cmd --setup`。共享终端遮住配对信息时，按 Ctrl-] 退出桌面接管，再按空行回车生成配对码；输入 `attach` 并回车重新接管。
 
-电脑设置和手机配对身份保存在 `%USERPROFILE%\.cloudterminal\agent.json`（或 `CLOUDTERMINAL_HOME`）。`--no-terminal` / `--terminal` 保存是否接管桌面终端的偏好。命令行参数优先于环境变量，环境变量优先于已保存设置；环境中的连接密钥不会另行写入保存配置。macOS / Linux 使用根目录的 `sh start.sh`。
+电脑设置和手机配对身份保存在 `%USERPROFILE%\.cloudterminal\agent.json`（或 `CLOUDTERMINAL_HOME`）。`--no-terminal` / `--terminal` 保存是否接管桌面终端的偏好。命令行参数优先于环境变量，环境变量优先于已保存设置；环境中的连接密钥不会另行写入保存配置。macOS / Linux 使用主仓库根目录的 `sh start.sh`。
 
 Codex Desktop 本机适配仍在联调，部署中继本身不代表 Desktop 项目、历史和控制功能已经验收通过。
 

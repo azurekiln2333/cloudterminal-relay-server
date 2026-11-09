@@ -108,7 +108,9 @@ test('default compose entries pull an image and never build on the server', asyn
     }
     assert.match(relay, /^ {4}restart: unless-stopped$/m, `${file} must restart the relay`);
     assert.match(relay, /^ {4}init: true$/m, `${file} must run with an init process`);
-    assert.match(compose, /^volumes:\n {2}relay-data:$/m, `${file} must keep the persistent key volume`);
+    // `compose` is the raw file text, so it may arrive with CRLF line endings
+    // (a Windows checkout). Anchor with `\r?\n` rather than a literal `\n`.
+    assert.match(compose, /^volumes:\r?\n {2}relay-data:$/m, `${file} must keep the persistent key volume`);
   }
 
   const lan = await read('compose.yml');
@@ -341,7 +343,7 @@ test('optional account settings actually reach the relay container', async () =>
   const tls = serviceBlock(await read('compose.tls.yml'), 'relay');
   assert.match(
     tls,
-    /^ {4}environment:\n(?: {6}#.*\n)* {6}RELAY_TRUST_PROXY: "1"$/m,
+    /^ {4}environment:\r?\n(?: {6}#.*\r?\n)* {6}RELAY_TRUST_PROXY: "1"$/m,
     'TLS entry must pin RELAY_TRUST_PROXY in environment:, which outranks env_file',
   );
 
