@@ -1,0 +1,217 @@
+# Builds the relay container image, and publishes it on releases.
+#
+# Credential rules:
+#   * pull requests never log in to any registry and never push. They only
+#     build the Dockerfile and smoke-test the resulting image, so a fork PR has
+#     nothing to leak and no way to publish.
+#   * pushes log in with the repository token (GHCR default) or with
+#     REGISTRY_USERNAME / REGISTRY_PASSWORD when publishing elsewhere.
+#
+# Release rules:
+#   * `v*` tags publish `<image>:<tag>` and add `:latest` only for a stable
+#     version. A pre-release tag such as `v0.2.0-rc.1` never moves `latest`.
+#   * default-branch pushes publish `sha-<short>` and the branch name, so a
+#     build can be pulled for testing without pretending to be a release.
+#   * every run builds one image, smoke-tests that exact image (health endpoint,
+#     non-root user, persistent key, and a real agent registration answered with
+#     `hello_ok`), and only then pushes it. An image that fails its own relay
+#     smoke test is never published.
+#   * the release job waits for the static deployment check, so a broken
+#     Compose/Dockerfile contract cannot be published.
+#
+# Repository variables (optional overrides):
+#   RELAY_IMAGE_REGISTRY  default `ghcr.io`
+#   RELAY_IMAGE_NAME      default the repository itself (`<owner>/<repo>`)
+name: Relay image
+
+on:
+  pull_request:
+  push:
+    branches: ["main"]
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag to publish (for example v0.1.0)"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+env:
+  IMAGE_REGISTRY: ${{ vars.RELAY_IMAGE_REGISTRY || 'ghcr.io' }}
+  IMAGE_REPOSITORY: ${{ vars.RELAY_IMAGE_NAME || github.repository }}
+
+jobs:
+  deployment-files:
+    name: Deployment file check
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: "24"
+      # Static only: no dependencies are installed, because the deployment
+      # contract is about Compose/Dockerfile/CI files, not relay behaviour.
+      - name: Check that default deployment stays image-only
+        run: node --test test/deployment-image.test.ts
+
+  image:
+    name: Build relay image
+    # Publishing must not survive a failed static deployment check.
+    needs: [deployment-files]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Resolve image reference and tags
+        id: meta
+        shell: bash
+        env:
+          # Never interpolate a dispatch input straight into shell text.
+          DISPATCH_TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+          repository="$(printf '%s' "${IMAGE_REPOSITORY}" | tr '[:upper:]' '[:lower:]')"
+          image="${IMAGE_REGISTRY}/${repository}"
+          tags=()
+          push=true
+          case "${GITHUB_EVENT_NAME}" in
+            push)
+              if [ "${GITHUB_REF_TYPE}" = "tag" ]; then
+                ref="${GITHUB_REF_NAME}"
+                tags+=("${image}:${ref}")
+                case "${ref}" in
+                  *-*) echo "pre-release ${ref}: latest tag skipped" ;;
+                  *) tags+=("${image}:latest") ;;
+                esac
+              else
+                tags+=("${image}:sha-${GITHUB_SHA::7}")
+                tags+=("${image}:${GITHUB_REF_NAME}")
+              fi
+              ;;
+            workflow_dispatch)
+              # Docker tag grammar: 1-128 chars from [A-Za-z0-9._-], and it may
+              # not start with a dot or a dash.
+              if [[ ! "${DISPATCH_TAG}" =~ ^[A-Za-z0-9_][A-Za-z0-9._-]{0,127}$ ]]; then
+                echo "invalid dispatch tag '${DISPATCH_TAG}': expected a Docker tag such as v0.1.0" >&2
+                exit 1
+              fi
+              tags+=("${image}:${DISPATCH_TAG}")
+              ;;
+            *)
+              # Validated only; this tag is never pushed.
+              push=false
+              tags+=("${image}:pr-${GITHUB_SHA::7}")
+              ;;
+          esac
+          {
+            echo "image=${image}"
+            echo "push=${push}"
+            echo "tags<<TAGS_EOF"
+            printf '%s\n' "${tags[@]}"
+            echo "TAGS_EOF"
+          } >> "${GITHUB_OUTPUT}"
+
+      - uses: docker/setup-buildx-action@v4
+
+      # One build, loaded into the local daemon. The smoke test below inspects
+      # this exact image, and only a passing image is ever pushed.
+      - name: Build image
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          file: ./Dockerfile
+          push: false
+          load: true
+          tags: ${{ steps.meta.outputs.image }}:candidate
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          labels: |
+            org.opencontainers.image.title=cloudterminal-relay
+            org.opencontainers.image.description=CloudTerminal relay (no desktop agent)
+            org.opencontainers.image.revision=${{ github.sha }}
+
+      # Proves the Dockerfile produces a working relay, not just a layer
+      # stack: the process starts, serves /healthz, runs unprivileged, keeps its
+      # key file, and answers a real agent registration with `hello_ok`.
+      # Every probe runs inside the container, so nothing depends on how the
+      # host publishes ports.
+      - name: Smoke-test the built image
+        shell: bash
+        env:
+          IMAGE: ${{ steps.meta.outputs.image }}:candidate
+        run: |
+          set -euo pipefail
+          NAME=cloudterminal-smoke
+          docker volume create cloudterminal-smoke-data >/dev/null
+          docker run -d --name "${NAME}" \
+            -v cloudterminal-smoke-data:/data \
+            "${IMAGE}" >/dev/null
+          cleanup() {
+            docker rm -f "${NAME}" >/dev/null 2>&1 || true
+            docker volume rm cloudterminal-smoke-data >/dev/null 2>&1 || true
+          }
+          trap cleanup EXIT
+          healthy=0
+          for _ in $(seq 1 40); do
+            if docker exec "${NAME}" node -e "fetch('http://127.0.0.1:8787/healthz',{signal:AbortSignal.timeout(4000)}).then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"; then
+              healthy=1
+              break
+            fi
+            sleep 2
+          done
+          if [ "${healthy}" -ne 1 ]; then
+            echo "relay never became healthy; refusing to publish" >&2
+            docker logs "${NAME}" >&2 || true
+            exit 1
+          fi
+          test "$(docker exec "${NAME}" id -un)" = "node"
+          docker exec "${NAME}" test -s /data/relay-key
+          KEY="$(docker exec "${NAME}" node src/relay/show-key.ts)"
+          docker exec -e "RELAY_KEY=${KEY}" "${NAME}" node --input-type=module -e '
+            import ws from "ws";
+            const WebSocket = ws.WebSocket ?? ws;
+            const socket = new WebSocket("ws://127.0.0.1:8787/ws");
+            const finish = (code, text) => { console.log(text); process.exit(code); };
+            socket.on("open", () => socket.send(JSON.stringify({
+              t: "hello", role: "agent", agentId: "ci-smoke", secretHash: "a".repeat(64),
+              relayKey: process.env.RELAY_KEY, name: "CI smoke", v: 1,
+            })));
+            socket.on("message", (frame) => {
+              const message = JSON.parse(frame.toString());
+              finish(message.t === "hello_ok" ? 0 : 1, "relay replied " + frame.toString());
+            });
+            socket.on("error", (error) => finish(1, "socket error: " + error.message));
+            setTimeout(() => finish(1, "timeout waiting for hello_ok"), 8000);
+          '
+          echo "image smoke test passed: ${IMAGE}"
+
+      # Never runs for pull requests, so no registry credential is exposed to
+      # PR builds and no secrets are required from forks.
+      - name: Log in to the registry
+        if: steps.meta.outputs.push == 'true'
+        uses: docker/login-action@v4
+        with:
+          registry: ${{ env.IMAGE_REGISTRY }}
+          username: ${{ secrets.REGISTRY_USERNAME || github.actor }}
+          password: ${{ secrets.REGISTRY_PASSWORD || github.token }}
+
+      - name: Push the smoke-tested image
+        if: steps.meta.outputs.push == 'true'
+        shell: bash
+        env:
+          IMAGE: ${{ steps.meta.outputs.image }}:candidate
+          TAGS: ${{ steps.meta.outputs.tags }}
+        run: |
+          set -euo pipefail
+          while IFS= read -r tag; do
+            [ -n "${tag}" ] || continue
+            docker tag "${IMAGE}" "${tag}"
+            docker push "${tag}"
+            echo "pushed ${tag}"
+          done <<< "${TAGS}"

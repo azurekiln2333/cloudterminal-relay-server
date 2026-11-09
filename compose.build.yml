@@ -1,0 +1,14 @@
+# Explicit local-build override. Nothing loads this file unless you name it on
+# the command line, so the default deployments stay image-only.
+#
+#   docker compose -f compose.yml     -f compose.build.yml up -d --build   # LAN
+#   docker compose -f compose.tls.yml -f compose.build.yml up -d --build   # TLS
+#
+# Source uploads are supported for this path: the context is this directory.
+services:
+  relay:
+    image: "${RELAY_LOCAL_IMAGE:-cloudterminal-relay:local}"
+    pull_policy: build
+    build:
+      context: .
+      dockerfile: Dockerfile

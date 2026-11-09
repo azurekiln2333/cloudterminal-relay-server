@@ -1,0 +1,49 @@
+# Public HTTPS relay entry — image-only, same as compose.yml.
+#
+# Only TCP 80/443 are published; the relay's own 8787 stays on the Compose
+# network behind Caddy. Use this file INSTEAD of compose.yml, never in
+# addition to it:
+#   docker compose -f compose.tls.yml up -d
+# Local build override:
+#   docker compose -f compose.tls.yml -f compose.build.yml up -d --build
+name: cloudterminal
+services:
+  relay:
+    image: "${RELAY_IMAGE:-ghcr.io/azurekiln2333/cloudterminal-relay-server:latest}"
+    restart: unless-stopped
+    init: true
+    # Optional settings (DB_*, OAUTH_*, RELAY_*) come from the same .env this
+    # file interpolates. `required: false` keeps a missing .env working exactly
+    # as before, and explicit `environment:` entries below still win.
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      # Rate limiting must see the real client address, not Caddy's.
+      RELAY_TRUST_PROXY: "1"
+    volumes:
+      - relay-data:/data
+    logging:
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: "3"
+  caddy:
+    image: caddy:2-alpine
+    restart: unless-stopped
+    environment:
+      RELAY_DOMAIN: "${RELAY_DOMAIN:?Set RELAY_DOMAIN to your public domain}"
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./deploy/Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data
+      - caddy-config:/config
+    depends_on:
+      relay:
+        condition: service_healthy
+volumes:
+  relay-data:
+  caddy-data:
+  caddy-config:

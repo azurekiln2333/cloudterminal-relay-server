@@ -1,0 +1,11 @@
+node_modules/
+
+# Local configuration. `.env.example` is the committed template.
+.env
+.env.*
+!.env.example
+
+# Local debug scripts and stray runtime files.
+*.cjs
+*.pid
+*.log

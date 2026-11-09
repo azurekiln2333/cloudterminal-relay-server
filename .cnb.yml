@@ -1,0 +1,173 @@
+# CNB (cnb.cool) pipeline for the relay container image.
+#
+# What each event does:
+#   pull_request : static check, build, real relay smoke. Never pushes.
+#   api_trigger  : same as pull_request, for manual verification runs.
+#   main push    : publishes <image>:sha-<short> for pull-and-test, never
+#                  `latest`, so unreleased code is never implied to be stable.
+#   `v*` tag     : publishes <image>:<tag>, and `:latest` only for a stable
+#                  version. `v0.2.0-rc.1` deliberately leaves `latest` alone.
+#
+# Publishing rules, enforced by the stage order below (and covered by
+# test/deployment-image.test.ts):
+#   * every pipeline starts with the static deployment check;
+#   * every pipeline builds one image tagged `cloudterminal-ci:build`;
+#   * every pipeline smoke-tests that exact image -- /healthz, non-root user,
+#     persistent key file, and a real agent registration answered with
+#     `hello_ok` -- before anything is pushed;
+#   * only then does a publishing pipeline retag and push. A pipeline that
+#     cannot prove the relay works never reaches the registry.
+#
+# Image path: ${CNB_DOCKER_REGISTRY}/${CNB_REPO_SLUG_LOWERCASE} by default, the
+# platform's own same-name artifact rule. Override with CNB_IMAGE. To publish
+# to a different registry set CNB_REGISTRY, CNB_REGISTRY_USER and
+# CNB_REGISTRY_PASSWORD (injected as env/imports, never committed).
+#
+# `services: [docker]` injects a Docker daemon and CLI and logs the build in to
+# the CNB artifact registry, which is why no credential appears in this file.
+
+main:
+  pull_request:
+    - name: verify-relay-image
+      docker: &relay-build-image
+        image: node:24-bookworm-slim
+      services: &relay-build-services
+        - docker
+      stages:
+        - name: static-deployment-check
+          script: &static-check node --test test/deployment-image.test.ts
+        - name: build-image
+          script: &build-image |
+            set -euo pipefail
+            docker build -t cloudterminal-ci:build .
+        - name: smoke-test-image
+          script: &smoke-image |
+            set -euo pipefail
+            IMAGE="cloudterminal-ci:build"
+            NAME="cloudterminal-ci-${CNB_COMMIT_SHORT}"
+            VOLUME="${NAME}-data"
+            cleanup() {
+              docker rm -f "${NAME}" >/dev/null 2>&1 || true
+              docker volume rm "${VOLUME}" >/dev/null 2>&1 || true
+            }
+            trap cleanup EXIT
+            docker volume create "${VOLUME}" >/dev/null
+            # No published port: every probe runs inside the container, so the
+            # check does not depend on how the daemon exposes ports.
+            docker run -d --name "${NAME}" -v "${VOLUME}:/data" "${IMAGE}" >/dev/null
+            healthy=0
+            for _ in $(seq 1 40); do
+              if docker exec "${NAME}" node -e "fetch('http://127.0.0.1:8787/healthz',{signal:AbortSignal.timeout(4000)}).then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"; then
+                healthy=1
+                break
+              fi
+              sleep 2
+            done
+            if [ "${healthy}" -ne 1 ]; then
+              echo "relay never became healthy; refusing to continue" >&2
+              docker logs "${NAME}" >&2 || true
+              exit 1
+            fi
+            test "$(docker exec "${NAME}" id -un)" = "node"
+            docker exec "${NAME}" test -s /data/relay-key
+            KEY="$(docker exec "${NAME}" node src/relay/show-key.ts)"
+            docker exec -e "RELAY_KEY=${KEY}" "${NAME}" node --input-type=module -e '
+              import ws from "ws";
+              const WebSocket = ws.WebSocket ?? ws;
+              const socket = new WebSocket("ws://127.0.0.1:8787/ws");
+              const finish = (code, text) => { console.log(text); process.exit(code); };
+              socket.on("open", () => socket.send(JSON.stringify({
+                t: "hello", role: "agent", agentId: "ci-smoke", secretHash: "a".repeat(64),
+                relayKey: process.env.RELAY_KEY, name: "CI smoke", v: 1,
+              })));
+              socket.on("message", (frame) => {
+                const message = JSON.parse(frame.toString());
+                finish(message.t === "hello_ok" ? 0 : 1, "relay replied " + frame.toString());
+              });
+              socket.on("error", (error) => finish(1, "socket error: " + error.message));
+              setTimeout(() => finish(1, "timeout waiting for hello_ok"), 8000);
+            '
+            echo "smoke passed for ${IMAGE}"
+
+  api_trigger:
+    - name: verify-relay-image
+      docker: *relay-build-image
+      services: *relay-build-services
+      stages:
+        - name: static-deployment-check
+          script: *static-check
+        - name: build-image
+          script: *build-image
+        - name: smoke-test-image
+          script: *smoke-image
+
+  push:
+    - name: publish-relay-image-sha
+      docker: *relay-build-image
+      services: *relay-build-services
+      stages:
+        - name: static-deployment-check
+          script: *static-check
+        - name: build-image
+          script: *build-image
+        - name: smoke-test-image
+          script: *smoke-image
+        - name: publish-image
+          script: |
+            set -euo pipefail
+            REGISTRY="${CNB_REGISTRY:-${CNB_DOCKER_REGISTRY}}"
+            IMAGE="${CNB_IMAGE:-${REGISTRY}/${CNB_REPO_SLUG_LOWERCASE}}"
+            if [ -n "${CNB_REGISTRY_PASSWORD:-}" ]; then
+              printf '%s' "${CNB_REGISTRY_PASSWORD}" \
+                | docker login "${REGISTRY}" -u "${CNB_REGISTRY_USER:-cnb}" --password-stdin
+            fi
+            TAG="sha-${CNB_COMMIT_SHORT}"
+            docker tag cloudterminal-ci:build "${IMAGE}:${TAG}"
+            docker push "${IMAGE}:${TAG}"
+            echo "pushed ${IMAGE}:${TAG}"
+
+"v*":
+  tag_push:
+    - name: publish-relay-image
+      docker: *relay-build-image
+      services: *relay-build-services
+      stages:
+        - name: static-deployment-check
+          script: *static-check
+        - name: validate-release-tag
+          script: |
+            set -euo pipefail
+            TAG="${CNB_BRANCH}"
+            case "${TAG}" in
+              v[0-9]*.[0-9]*.[0-9]*) echo "release tag ${TAG}" ;;
+              *)
+                echo "release tag must look like vX.Y.Z, received ${TAG}" >&2
+                exit 1
+                ;;
+            esac
+        - name: build-image
+          script: *build-image
+        - name: smoke-test-image
+          script: *smoke-image
+        - name: publish-image
+          script: |
+            set -euo pipefail
+            TAG="${CNB_BRANCH}"
+            REGISTRY="${CNB_REGISTRY:-${CNB_DOCKER_REGISTRY}}"
+            IMAGE="${CNB_IMAGE:-${REGISTRY}/${CNB_REPO_SLUG_LOWERCASE}}"
+            if [ -n "${CNB_REGISTRY_PASSWORD:-}" ]; then
+              printf '%s' "${CNB_REGISTRY_PASSWORD}" \
+                | docker login "${REGISTRY}" -u "${CNB_REGISTRY_USER:-cnb}" --password-stdin
+            fi
+            docker tag cloudterminal-ci:build "${IMAGE}:${TAG}"
+            docker push "${IMAGE}:${TAG}"
+            case "${TAG}" in
+              *-*)
+                echo "pre-release ${TAG}: latest tag skipped"
+                ;;
+              *)
+                docker tag cloudterminal-ci:build "${IMAGE}:latest"
+                docker push "${IMAGE}:latest"
+                echo "pushed ${IMAGE}:${TAG} and ${IMAGE}:latest"
+                ;;
+            esac

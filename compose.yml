@@ -1,0 +1,36 @@
+# LAN / VPN relay entry — the default deployment.
+#
+# This file pulls a published image only. The server never compiles the relay,
+# never mounts relay source and never runs `npm` on the host.
+#
+# The default image path is the GitHub artifact path derived from this
+# repository (ghcr.io/azurekiln2333/cloudterminal-relay-server). No image
+# exists there yet: the first CI release (see .github/workflows/image.yml and
+# .cnb.yml) must publish it before `docker compose pull` can succeed.
+# Until then point RELAY_IMAGE at an image you actually pushed, or build
+# locally with the explicit override:
+#   docker compose -f compose.yml -f compose.build.yml up -d --build
+name: cloudterminal
+services:
+  relay:
+    image: "${RELAY_IMAGE:-ghcr.io/azurekiln2333/cloudterminal-relay-server:latest}"
+    restart: unless-stopped
+    init: true
+    # Optional settings (DB_*, OAUTH_*, RELAY_*) come from the same .env this
+    # file interpolates. `required: false` keeps a missing .env working exactly
+    # as before, and explicit `environment:` entries below still win.
+    env_file:
+      - path: .env
+        required: false
+    ports:
+      - "${RELAY_PORT:-8787}:8787"
+    volumes:
+      # Persists /data/relay-key across restarts and image upgrades.
+      - relay-data:/data
+    logging:
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: "3"
+volumes:
+  relay-data:

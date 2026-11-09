@@ -1,0 +1,16 @@
+# Only the relay runtime inputs may enter the build context.
+**
+!deploy/
+!deploy/relay/
+!deploy/relay/package.json
+!deploy/relay/package-lock.json
+!Dockerfile
+!src/
+!src/shared/
+!src/shared/**
+!src/relay/
+!src/relay/**
+!src/db/
+!src/db/**
+!src/oauth/
+!src/oauth/**
